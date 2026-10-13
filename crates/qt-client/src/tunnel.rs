@@ -597,10 +597,7 @@ mod tests {
         assert!(client.is_running());
         assert_eq!(client.assigned_port(), Some(tcp_port));
 
-        // 4. Start public TCP visitor port listener on server
-        let stop_tx = server.tcp_proxy().start_listener(tcp_port).await.unwrap();
-
-        // 5. Visitor connects directly to server public TCP port
+        // 4. Visitor connects directly to server public TCP port (started by server on registration)
         let mut visitor = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
             .await
             .unwrap();
@@ -610,7 +607,6 @@ mod tests {
         visitor.read_exact(&mut resp).await.unwrap();
         assert_eq!(&resp, b"PING TCP ECHO 12345");
 
-        let _ = stop_tx.send(());
         client.shutdown();
         server.shutdown();
     }

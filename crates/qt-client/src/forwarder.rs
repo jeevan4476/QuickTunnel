@@ -14,6 +14,7 @@ use qt_mux::MuxHandle;
 use qt_proto::{ProtoError, Result, TunnelMode};
 
 use crate::config::HostHeaderRewrite;
+use crate::pool::OriginPool;
 
 /// Maximum HTTP request headers size (8 KiB)
 pub const MAX_HEADER_SIZE: usize = 8192;
@@ -29,23 +30,33 @@ pub struct LocalForwarder {
     host_header: HostHeaderRewrite,
     connect_timeout: Duration,
     tap: Option<HttpTapSender>,
+    pool: Option<OriginPool>,
 }
 
 impl LocalForwarder {
     /// Create a new `LocalForwarder`.
     pub fn new(local_target: SocketAddr, mode: TunnelMode, host_header: HostHeaderRewrite) -> Self {
+        let pool = if mode == TunnelMode::Http {
+            Some(OriginPool::new(local_target, DEFAULT_CONNECT_TIMEOUT))
+        } else {
+            None
+        };
         Self {
             local_target,
             mode,
             host_header,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             tap: None,
+            pool,
         }
     }
 
     /// Set custom dial timeout for connecting to local target.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        if let Some(pool) = self.pool.take() {
+            self.pool = Some(pool.with_connect_timeout(timeout));
+        }
         self
     }
 
@@ -53,6 +64,17 @@ impl LocalForwarder {
     pub fn with_tap(mut self, tap: HttpTapSender) -> Self {
         self.tap = Some(tap);
         self
+    }
+
+    /// Configure or disable the origin connection pool.
+    pub fn with_pool(mut self, pool: Option<OriginPool>) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    /// Configured origin connection pool, if any.
+    pub fn pool(&self) -> Option<&OriginPool> {
+        self.pool.as_ref()
     }
 
     /// Configured HTTP tap pipeline, if any.
@@ -146,10 +168,12 @@ impl LocalForwarder {
         let req_start_time = tokio::time::Instant::now();
 
         let replacement = self.host_header.resolve_host(&self.local_target);
-        let rewritten_bytes = match rewrite_http_headers(
+        let use_keepalive = self.pool.is_some();
+        let rewritten_bytes = match rewrite_http_headers_with_keepalive(
             &buffer,
             header_end,
             replacement.as_deref(),
+            use_keepalive,
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -160,52 +184,79 @@ impl LocalForwarder {
             }
         };
 
-        // Connect to local service with dial timeout (§12.2)
-        let connect_fut = tokio::net::TcpStream::connect(self.local_target);
-        let mut local_socket = match tokio::time::timeout(self.connect_timeout, connect_fut).await {
-            Ok(Ok(s)) => {
-                s.set_nodelay(true).ok();
-                s
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "Failed to connect to local target {}: {}",
-                    self.local_target,
-                    e
-                );
-                let bad_gw = format_502_bad_gateway(&self.local_target);
-                if let (Some(tap), Some(id)) = (&self.tap, &tap_req_id) {
-                    tap.tap_response(id.clone(), &bad_gw, req_start_time.elapsed());
+        // Connect to local service or acquire from pool
+        let (mut local_socket, is_reused) = match &self.pool {
+            Some(pool) => match pool.acquire().await {
+                Ok((s, reused)) => (s, reused),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to connect to local target {}: {}",
+                        self.local_target,
+                        e
+                    );
+                    let bad_gw = format_502_bad_gateway(&self.local_target);
+                    if let (Some(tap), Some(id)) = (&self.tap, &tap_req_id) {
+                        tap.tap_response(id.clone(), &bad_gw, req_start_time.elapsed());
+                    }
+                    stream
+                        .write_all(&bad_gw)
+                        .await
+                        .map_err(|err| ProtoError::IoError(err.to_string()))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|err| ProtoError::IoError(err.to_string()))?;
+                    return Ok(());
                 }
-                stream
-                    .write_all(&bad_gw)
-                    .await
-                    .map_err(|err| ProtoError::IoError(err.to_string()))?;
-                stream
-                    .flush()
-                    .await
-                    .map_err(|err| ProtoError::IoError(err.to_string()))?;
-                return Ok(());
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Timeout connecting to local target {} (after {:?})",
-                    self.local_target,
-                    self.connect_timeout
-                );
-                let bad_gw = format_502_bad_gateway(&self.local_target);
-                if let (Some(tap), Some(id)) = (&self.tap, &tap_req_id) {
-                    tap.tap_response(id.clone(), &bad_gw, req_start_time.elapsed());
+            },
+            None => {
+                let connect_fut = tokio::net::TcpStream::connect(self.local_target);
+                match tokio::time::timeout(self.connect_timeout, connect_fut).await {
+                    Ok(Ok(s)) => {
+                        s.set_nodelay(true).ok();
+                        (s, false)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Failed to connect to local target {}: {}",
+                            self.local_target,
+                            e
+                        );
+                        let bad_gw = format_502_bad_gateway(&self.local_target);
+                        if let (Some(tap), Some(id)) = (&self.tap, &tap_req_id) {
+                            tap.tap_response(id.clone(), &bad_gw, req_start_time.elapsed());
+                        }
+                        stream
+                            .write_all(&bad_gw)
+                            .await
+                            .map_err(|err| ProtoError::IoError(err.to_string()))?;
+                        stream
+                            .flush()
+                            .await
+                            .map_err(|err| ProtoError::IoError(err.to_string()))?;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Timeout connecting to local target {} (after {:?})",
+                            self.local_target,
+                            self.connect_timeout
+                        );
+                        let bad_gw = format_502_bad_gateway(&self.local_target);
+                        if let (Some(tap), Some(id)) = (&self.tap, &tap_req_id) {
+                            tap.tap_response(id.clone(), &bad_gw, req_start_time.elapsed());
+                        }
+                        stream
+                            .write_all(&bad_gw)
+                            .await
+                            .map_err(|err| ProtoError::IoError(err.to_string()))?;
+                        stream
+                            .flush()
+                            .await
+                            .map_err(|err| ProtoError::IoError(err.to_string()))?;
+                        return Ok(());
+                    }
                 }
-                stream
-                    .write_all(&bad_gw)
-                    .await
-                    .map_err(|err| ProtoError::IoError(err.to_string()))?;
-                stream
-                    .flush()
-                    .await
-                    .map_err(|err| ProtoError::IoError(err.to_string()))?;
-                return Ok(());
             }
         };
 
@@ -228,13 +279,18 @@ impl LocalForwarder {
                 id,
                 req_start_time,
                 initial_body_len,
+                self.pool.clone(),
             )
             .await?;
         } else {
-            // Splice bidirectionally
-            tokio::io::copy_bidirectional(&mut stream, &mut local_socket)
-                .await
-                .map_err(|e| ProtoError::IoError(e.to_string()))?;
+            forward_response_direct(
+                stream,
+                local_socket,
+                self.pool.clone(),
+                is_reused,
+                &rewritten_bytes,
+            )
+            .await?;
         }
 
         Ok(())
@@ -300,145 +356,349 @@ async fn forward_and_tap_response<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     req_id: String,
     req_start_time: tokio::time::Instant,
     initial_body_len: usize,
+    pool: Option<OriginPool>,
 ) -> Result<()> {
     let (mut stream_r, mut stream_w) = tokio::io::split(stream);
-    let (mut local_r, mut local_w) = local_socket.split();
 
-    let req_id_c2l = req_id.clone();
-    let tap_c2l = tap.clone();
-    let client_to_local = async {
-        let mut buf = [0u8; 8192];
-        let mut captured_total = initial_body_len;
-        let mut res = Ok(());
-        loop {
-            match stream_r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if captured_total < qt_inspector_ui::tap::MAX_BODY_CAPTURE_SIZE {
-                        let to_capture =
-                            n.min(qt_inspector_ui::tap::MAX_BODY_CAPTURE_SIZE - captured_total);
-                        tap_c2l.tap_request_body_chunk(req_id_c2l.clone(), &buf[..to_capture]);
-                        captured_total += to_capture;
+    let (res, reusable) = {
+        let (mut local_r, mut local_w) = local_socket.split();
+
+        let req_id_c2l = req_id.clone();
+        let tap_c2l = tap.clone();
+        let client_to_local = async {
+            let mut buf = [0u8; 8192];
+            let mut captured_total = initial_body_len;
+            let mut res = Ok(());
+            loop {
+                match stream_r.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if captured_total < qt_inspector_ui::tap::MAX_BODY_CAPTURE_SIZE {
+                            let to_capture =
+                                n.min(qt_inspector_ui::tap::MAX_BODY_CAPTURE_SIZE - captured_total);
+                            tap_c2l.tap_request_body_chunk(req_id_c2l.clone(), &buf[..to_capture]);
+                            captured_total += to_capture;
+                        }
+                        if let Err(e) = local_w.write_all(&buf[..n]).await {
+                            res = Err(e);
+                            break;
+                        }
                     }
-                    if let Err(e) = local_w.write_all(&buf[..n]).await {
+                    Err(e) => {
                         res = Err(e);
                         break;
                     }
-                }
-                Err(e) => {
-                    res = Err(e);
-                    break;
                 }
             }
-        }
-        let _ = local_w.shutdown().await;
-        res
-    };
+            let _ = local_w.flush().await;
+            res
+        };
 
-    let local_to_client = async {
-        const MAX_CAPTURE: usize = 1024 * 1024 + 16384;
-        let mut captured_bytes = Vec::new();
-        let mut ttfb: Option<Duration> = None;
-        let mut buf = [0u8; 8192];
-        let mut res = Ok(());
+        let local_to_client = async {
+            const MAX_CAPTURE: usize = 1024 * 1024 + 16384;
+            let mut captured_bytes = Vec::new();
+            let mut ttfb: Option<Duration> = None;
+            let mut buf = [0u8; 8192];
+            let mut res = Ok(());
 
-        let mut parsed_headers = false;
-        let mut expected_response_len: Option<usize> = None;
-        let mut response_tapped = false;
-        let mut total_transferred: usize = 0;
+            let mut parsed_headers = false;
+            let mut expected_response_len: Option<usize> = None;
+            let mut can_reuse = true;
+            let mut response_tapped = false;
+            let mut total_transferred: usize = 0;
 
-        loop {
-            match local_r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if ttfb.is_none() {
-                        ttfb = Some(req_start_time.elapsed());
-                    }
-                    total_transferred += n;
-                    if captured_bytes.len() < MAX_CAPTURE {
-                        let to_take = n.min(MAX_CAPTURE - captured_bytes.len());
-                        captured_bytes.extend_from_slice(&buf[..to_take]);
-                    }
-                    if let Err(e) = stream_w.write_all(&buf[..n]).await {
-                        res = Err(e);
+            loop {
+                match local_r.read(&mut buf).await {
+                    Ok(0) => {
+                        if expected_response_len.is_some()
+                            && total_transferred < expected_response_len.unwrap()
+                        {
+                            can_reuse = false;
+                        }
                         break;
                     }
+                    Ok(n) => {
+                        if ttfb.is_none() {
+                            ttfb = Some(req_start_time.elapsed());
+                        }
+                        total_transferred += n;
+                        if captured_bytes.len() < MAX_CAPTURE {
+                            let to_take = n.min(MAX_CAPTURE - captured_bytes.len());
+                            captured_bytes.extend_from_slice(&buf[..to_take]);
+                        }
+                        if let Err(e) = stream_w.write_all(&buf[..n]).await {
+                            res = Err(e);
+                            can_reuse = false;
+                            break;
+                        }
 
-                    // Check for headers end and Content-Length
-                    if !parsed_headers {
-                        if let Some(crlf_pos) = find_crlf_crlf(&captured_bytes) {
-                            parsed_headers = true;
-                            let header_end_offset = crlf_pos + 4;
-                            let mut headers = [httparse::EMPTY_HEADER; 64];
-                            let mut resp = httparse::Response::new(&mut headers);
-                            if let Ok(httparse::Status::Complete(_)) = resp.parse(&captured_bytes) {
-                                if let Some(h) = resp
-                                    .headers
-                                    .iter()
-                                    .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+                        // Check for headers end and Content-Length
+                        if !parsed_headers {
+                            if let Some(crlf_pos) = find_crlf_crlf(&captured_bytes) {
+                                parsed_headers = true;
+                                let header_end_offset = crlf_pos + 4;
+                                let mut headers = [httparse::EMPTY_HEADER; 64];
+                                let mut resp = httparse::Response::new(&mut headers);
+                                if let Ok(httparse::Status::Complete(_)) =
+                                    resp.parse(&captured_bytes)
                                 {
-                                    if let Ok(s) = std::str::from_utf8(h.value) {
-                                        if let Ok(cl) = s.trim().parse::<usize>() {
-                                            expected_response_len = Some(header_end_offset + cl);
+                                    for h in resp.headers.iter() {
+                                        if h.name.eq_ignore_ascii_case("Connection") {
+                                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                                if s.to_ascii_lowercase().contains("close") {
+                                                    can_reuse = false;
+                                                }
+                                            }
+                                        } else if h.name.eq_ignore_ascii_case("Content-Length") {
+                                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                                if let Ok(cl) = s.trim().parse::<usize>() {
+                                                    expected_response_len =
+                                                        Some(header_end_offset + cl);
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // If expected total response bytes reached, trigger tap immediately
-                    if let Some(expected_len) = expected_response_len {
-                        if total_transferred >= expected_len {
-                            if !response_tapped && !captured_bytes.is_empty() {
-                                let total_duration = req_start_time.elapsed();
-                                let ttfb_duration = ttfb.unwrap_or(total_duration);
-                                tap.tap_response_with_ttfb(
-                                    req_id.clone(),
-                                    &captured_bytes,
-                                    total_duration,
-                                    ttfb_duration,
-                                );
-                                response_tapped = true;
+                        // If expected total response bytes reached, trigger tap immediately
+                        if let Some(expected_len) = expected_response_len {
+                            if total_transferred >= expected_len {
+                                if !response_tapped && !captured_bytes.is_empty() {
+                                    let total_duration = req_start_time.elapsed();
+                                    let ttfb_duration = ttfb.unwrap_or(total_duration);
+                                    tap.tap_response_with_ttfb(
+                                        req_id.clone(),
+                                        &captured_bytes,
+                                        total_duration,
+                                        ttfb_duration,
+                                    );
+                                    response_tapped = true;
+                                }
+                                let _ = stream_w.flush().await;
+                                break;
                             }
-                            let _ = stream_w.flush().await;
+                        }
+                    }
+                    Err(e) => {
+                        res = Err(e);
+                        can_reuse = false;
+                        break;
+                    }
+                }
+            }
+            let _ = stream_w.flush().await;
+            let _ = stream_w.shutdown().await;
+
+            let total_duration = req_start_time.elapsed();
+            let ttfb_duration = ttfb.unwrap_or(total_duration);
+            if !response_tapped && !captured_bytes.is_empty() {
+                tap.tap_response_with_ttfb(req_id, &captured_bytes, total_duration, ttfb_duration);
+            }
+
+            let reusable = can_reuse
+                && expected_response_len.is_some()
+                && total_transferred == expected_response_len.unwrap();
+            (res, reusable)
+        };
+
+        tokio::pin!(client_to_local);
+        tokio::pin!(local_to_client);
+
+        tokio::select! {
+            c2l = &mut client_to_local => {
+                if let Err(e) = c2l {
+                    tracing::debug!("client_to_local finished with error: {e}");
+                }
+                local_to_client.await
+            }
+            (res, reusable) = &mut local_to_client => {
+                (res, reusable)
+            }
+        }
+    };
+
+    if let Err(e) = res {
+        tracing::debug!("local_to_client finished with error: {e}");
+    }
+
+    if reusable {
+        if let Some(pool) = pool {
+            pool.release(local_socket);
+        }
+    }
+
+    Ok(())
+}
+
+/// Forwards traffic bidirectionally without tap, recycling socket to OriginPool when complete.
+async fn forward_response_direct<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut stream: S,
+    mut local_socket: tokio::net::TcpStream,
+    pool: Option<OriginPool>,
+    is_reused: bool,
+    rewritten_bytes: &[u8],
+) -> Result<()> {
+    let pool = match pool {
+        Some(p) => p,
+        None => {
+            tokio::io::copy_bidirectional(&mut stream, &mut local_socket)
+                .await
+                .map_err(|e| ProtoError::IoError(e.to_string()))?;
+            return Ok(());
+        }
+    };
+
+    let (res, reusable, need_fresh_retry) = {
+        let (mut stream_r, mut stream_w) = tokio::io::split(&mut stream);
+        let (mut local_r, mut local_w) = local_socket.split();
+
+        let client_to_local = async {
+            let mut buf = [0u8; 8192];
+            let mut res = Ok(());
+            loop {
+                match stream_r.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Err(e) = local_w.write_all(&buf[..n]).await {
+                            res = Err(e);
                             break;
                         }
                     }
-                }
-                Err(e) => {
-                    res = Err(e);
-                    break;
+                    Err(e) => {
+                        res = Err(e);
+                        break;
+                    }
                 }
             }
-        }
-        let _ = stream_w.flush().await;
-        let _ = stream_w.shutdown().await;
+            let _ = local_w.flush().await;
+            res
+        };
 
-        let total_duration = req_start_time.elapsed();
-        let ttfb_duration = ttfb.unwrap_or(total_duration);
-        if !response_tapped && !captured_bytes.is_empty() {
-            tap.tap_response_with_ttfb(req_id, &captured_bytes, total_duration, ttfb_duration);
-        }
+        let local_to_client = async {
+            let mut buf = [0u8; 8192];
+            let mut header_buf = Vec::new();
+            let mut parsed_headers = false;
+            let mut expected_response_len: Option<usize> = None;
+            let mut can_reuse = true;
+            let mut need_fresh_retry = false;
+            let mut total_transferred: usize = 0;
+            let mut res = Ok(());
 
-        res
+            loop {
+                match local_r.read(&mut buf).await {
+                    Ok(0) => {
+                        if total_transferred == 0 && is_reused {
+                            need_fresh_retry = true;
+                            can_reuse = false;
+                        } else if expected_response_len.is_some()
+                            && total_transferred < expected_response_len.unwrap()
+                        {
+                            can_reuse = false;
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        total_transferred += n;
+                        if let Err(e) = stream_w.write_all(&buf[..n]).await {
+                            res = Err(e);
+                            can_reuse = false;
+                            break;
+                        }
+
+                        if !parsed_headers {
+                            header_buf.extend_from_slice(&buf[..n]);
+                            if let Some(crlf_pos) = find_crlf_crlf(&header_buf) {
+                                parsed_headers = true;
+                                let header_end_offset = crlf_pos + 4;
+                                let mut headers = [httparse::EMPTY_HEADER; 64];
+                                let mut resp = httparse::Response::new(&mut headers);
+                                if let Ok(httparse::Status::Complete(_)) = resp.parse(&header_buf) {
+                                    for h in resp.headers.iter() {
+                                        if h.name.eq_ignore_ascii_case("Connection") {
+                                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                                if s.to_ascii_lowercase().contains("close") {
+                                                    can_reuse = false;
+                                                }
+                                            }
+                                        } else if h.name.eq_ignore_ascii_case("Content-Length") {
+                                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                                if let Ok(cl) = s.trim().parse::<usize>() {
+                                                    expected_response_len =
+                                                        Some(header_end_offset + cl);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(expected_len) = expected_response_len {
+                            if total_transferred >= expected_len {
+                                let _ = stream_w.flush().await;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        res = Err(e);
+                        can_reuse = false;
+                        break;
+                    }
+                }
+            }
+            if !need_fresh_retry {
+                let _ = stream_w.flush().await;
+                let _ = stream_w.shutdown().await;
+            }
+
+            let reusable = can_reuse
+                && expected_response_len.is_some()
+                && total_transferred == expected_response_len.unwrap();
+            (res, reusable, need_fresh_retry)
+        };
+
+        tokio::pin!(client_to_local);
+        tokio::pin!(local_to_client);
+
+        tokio::select! {
+            c2l = &mut client_to_local => {
+                if let Err(e) = c2l {
+                    tracing::debug!("client_to_local finished with error: {e}");
+                }
+                local_to_client.await
+            }
+            (res, reusable, need_retry) = &mut local_to_client => {
+                (res, reusable, need_retry)
+            }
+        }
     };
 
-    tokio::pin!(client_to_local);
-    tokio::pin!(local_to_client);
+    if need_fresh_retry {
+        if let Ok(mut fresh_socket) = pool.dial_fresh().await {
+            if fresh_socket.write_all(rewritten_bytes).await.is_ok()
+                && fresh_socket.flush().await.is_ok()
+            {
+                return Box::pin(forward_response_direct(
+                    stream,
+                    fresh_socket,
+                    Some(pool),
+                    false,
+                    rewritten_bytes,
+                ))
+                .await;
+            }
+        }
+    }
 
-    tokio::select! {
-        c2l = &mut client_to_local => {
-            if let Err(e) = c2l {
-                tracing::debug!("client_to_local finished with error: {e}");
-            }
-            let _ = local_to_client.await;
-        }
-        l2c = &mut local_to_client => {
-            if let Err(e) = l2c {
-                tracing::debug!("local_to_client finished with error: {e}");
-            }
-        }
+    if let Err(e) = res {
+        tracing::debug!("local_to_client finished with error: {e}");
+    }
+
+    if reusable {
+        pool.release(local_socket);
     }
 
     Ok(())
@@ -525,6 +785,16 @@ pub fn rewrite_http_headers(
     header_end: usize,
     new_host: Option<&str>,
 ) -> Result<Vec<u8>> {
+    rewrite_http_headers_with_keepalive(buffer, header_end, new_host, false)
+}
+
+/// Parse and rewrite HTTP Host and Connection headers with keep-alive policy
+pub fn rewrite_http_headers_with_keepalive(
+    buffer: &[u8],
+    header_end: usize,
+    new_host: Option<&str>,
+    keep_alive: bool,
+) -> Result<Vec<u8>> {
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut req = httparse::Request::new(&mut headers);
     let status = req
@@ -602,13 +872,28 @@ pub fn rewrite_http_headers(
         .iter()
         .filter(|h| h.name.eq_ignore_ascii_case("Connection"));
 
+    let conn_val = if keep_alive {
+        b"Connection: keep-alive\r\n".to_vec()
+    } else {
+        b"Connection: close\r\n".to_vec()
+    };
+
+    let mut had_conn_header = false;
     if let Some(first_conn) = connection_headers.next() {
+        had_conn_header = true;
         let (start, end) = find_header_line_range(first_conn);
-        replacements.push((start, end, b"Connection: close\r\n".to_vec()));
+        replacements.push((start, end, conn_val));
 
         for extra_conn in connection_headers {
             let (start, end) = find_header_line_range(extra_conn);
             replacements.push((start, end, Vec::new()));
+        }
+    }
+
+    if keep_alive && !had_conn_header {
+        if let Some(h) = host_header {
+            let (_, end) = find_header_line_range(h);
+            replacements.push((end, end, b"Connection: keep-alive\r\n".to_vec()));
         }
     }
 
@@ -634,6 +919,9 @@ pub fn rewrite_http_headers(
         }
         rewritten.extend_from_slice(b"\r\nHost: ");
         rewritten.extend_from_slice(host_val.as_bytes());
+        if keep_alive && !had_conn_header {
+            rewritten.extend_from_slice(b"\r\nConnection: keep-alive");
+        }
         rewritten.extend_from_slice(b"\r\n\r\n");
         if buffer.len() > header_end + 4 {
             rewritten.extend_from_slice(&buffer[header_end + 4..]);
