@@ -1,0 +1,32 @@
+services:
+  # QuickTunnel Server Daemon
+  quicktunnel-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: quicktunnel-server
+    restart: unless-stopped
+    environment:
+      - QT_SECRET=${QT_SECRET:-c5ad56345d4eee43164450159822b08a9c4ac58c0cfe86e44fca139cb05c3320}
+    ports:
+      # Control listener
+      - "7000:7000"
+      # Public HTTP visitor proxy
+      - "80:80"
+      # TCP dynamic range
+      - "20000-20050:20000-20050"
+    command: >
+      server
+      --control-bind 0.0.0.0:7000
+      --http-bind 0.0.0.0:80
+      --domain ${QT_DOMAIN:-tunnel.local}
+      --tcp-port-range 20000-20050
+
+  # Example Client (exposing internal demo web server)
+  demo-service:
+    image: python:3.12-alpine
+    container_name: demo-service
+    command: python3 -m http.server 3000
+    restart: unless-stopped
+    expose:
+      - "3000"

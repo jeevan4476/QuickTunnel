@@ -1,0 +1,31 @@
+[Unit]
+Description=QuickTunnel Client Tunnel Daemon
+Documentation=https://github.com/quicktunnel/quicktunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quicktunnel
+Group=quicktunnel
+EnvironmentFile=-/etc/quicktunnel/client.env
+ExecStart=/usr/local/bin/quicktunnel client \
+    --to ${QT_SERVER_ADDR} \
+    --local ${QT_LOCAL_TARGET} \
+    --subdomain ${QT_SUBDOMAIN} \
+    --secret ${QT_SECRET} \
+    --host-header rewrite \
+    --no-inspect
+
+# Restart with backoff on drop
+Restart=always
+RestartSec=3s
+
+# Security Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

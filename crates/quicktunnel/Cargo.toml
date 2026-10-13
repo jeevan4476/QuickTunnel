@@ -1,0 +1,28 @@
+[package]
+name = "quicktunnel"
+version = "0.1.0"
+edition = "2021"
+description = "QuickTunnel CLI binary"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quicktunnel/quicktunnel"
+
+[[bin]]
+name = "quicktunnel"
+path = "src/main.rs"
+
+[dependencies]
+qt-proto = { path = "../qt-proto" }
+qt-mux = { path = "../qt-mux" }
+qt-server = { path = "../qt-server" }
+qt-client = { path = "../qt-client" }
+qt-inspector-ui = { path = "../qt-inspector-ui" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuickTunnel Inspector</title>
+  <style>
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-tertiary: #334155;
+      --border-color: #475569;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-blue: #38bdf8;
+      --accent-green: #4ade80;
+      --accent-yellow: #facc15;
+      --accent-red: #f87171;
+      --accent-purple: #c084fc;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.5;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Header Bar */
+    header {
+      background-color: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand h1 {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      color: var(--accent-blue);
+    }
+
+    .status-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .status-badge.connected {
+      background: rgba(74, 222, 128, 0.15);
+      color: var(--accent-green);
+      border: 1px solid rgba(74, 222, 128, 0.3);
+    }
+
+    .status-badge.disconnected {
+      background: rgba(248, 113, 113, 0.15);
+      color: var(--accent-red);
+      border: 1px solid rgba(248, 113, 113, 0.3);
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .metrics-bar {
+      display: flex;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .metric-item strong {
+      color: var(--text-main);
+      margin-left: 2px;
+    }
+
+    /* Toolbar & Search Bar */
+    .toolbar {
+      background: var(--bg-primary);
+      border-bottom: 1px solid var(--border-color);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    .search-input {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      color: var(--text-main);
+      padding: 6px 12px;
+      font-size: 13px;
+      flex: 1;
+      max-width: 380px;
+    }
+
+    .search-input:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+    }
+
+    .filter-group {
+      display: flex;
+      gap: 6px;
+    }
+
+    .btn {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 5px 10px;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .btn:hover {
+      background: var(--bg-tertiary);
+      color: var(--text-main);
+    }
+
+    .btn.active {
+      background: var(--accent-blue);
+      color: #0f172a;
+      border-color: var(--accent-blue);
+      font-weight: 600;
+    }
+
+    .btn-action {
+      background: var(--bg-secondary);
+      color: var(--accent-blue);
+      border-color: rgba(56, 189, 248, 0.4);
+    }
+
+    .btn-action:hover {
+      background: rgba(56, 189, 248, 0.1);
+      color: var(--accent-blue);
+    }
+
+    .btn-replay {
+      color: var(--accent-green);
+      border-color: rgba(74, 222, 128, 0.4);
+    }
+
+    .btn-replay:hover {
+      background: rgba(74, 222, 128, 0.1);
+      color: var(--accent-green);
+    }
+
+    .spacer {
+      flex: 1;
+    }
+
+    /* Main Container (Split Screen) */
+    .main-container {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Requests List Pane */
+    .requests-pane {
+      width: 48%;
+      min-width: 360px;
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-primary);
+    }
+
+    .table-header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      display: grid;
+      grid-template-columns: 80px 1fr 70px 75px 65px;
+      padding: 7px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+
+    .requests-list {
+      flex: 1;
+      overflow-y: auto;
+    }
+
+    .request-row {
+      display: grid;
+      grid-template-columns: 80px 1fr 70px 75px 65px;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(71, 85, 105, 0.3);
+      cursor: pointer;
+      align-items: center;
+      transition: background 0.1s ease;
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+
+    .request-row:hover {
+      background: rgba(51, 65, 85, 0.4);
+    }
+
+    .request-row.selected {
+      background: rgba(56, 189, 248, 0.12);
+      border-left: 3px solid var(--accent-blue);
+    }
+
+    .req-method {
+      font-weight: 700;
+      font-size: 11px;
+      border-radius: 4px;
+      padding: 2px 6px;
+      display: inline-block;
+      text-align: center;
+      width: fit-content;
+    }
+
+    .method-get { background: rgba(56, 189, 248, 0.15); color: var(--accent-blue); }
+    .method-post { background: rgba(74, 222, 128, 0.15); color: var(--accent-green); }
+    .method-put { background: rgba(250, 204, 21, 0.15); color: var(--accent-yellow); }
+    .method-delete { background: rgba(248, 113, 113, 0.15); color: var(--accent-red); }
+    .method-other { background: rgba(192, 132, 252, 0.15); color: var(--accent-purple); }
+
+    .req-path-container {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding-right: 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .req-path {
+      color: var(--text-main);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .badge-replay {
+      background: rgba(192, 132, 252, 0.2);
+      color: var(--accent-purple);
+      border: 1px solid rgba(192, 132, 252, 0.4);
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .req-status {
+      font-weight: 600;
+    }
+
+    .status-2xx { color: var(--accent-green); }
+    .status-3xx { color: var(--accent-blue); }
+    .status-4xx { color: var(--accent-yellow); }
+    .status-5xx { color: var(--accent-red); }
+    .status-pending { color: var(--text-muted); font-style: italic; }
+
+    .req-duration, .req-size {
+      color: var(--text-muted);
+    }
+
+    /* Detail Inspector Pane */
+    .detail-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-secondary);
+      overflow: hidden;
+    }
+
+    .detail-header {
+      padding: 12px 16px;
+      background: #182234;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    .detail-top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .detail-url-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      overflow: hidden;
+      font-family: var(--font-mono);
+    }
+
+    .detail-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .detail-nav-tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border-color);
+      padding: 0 16px;
+      background: var(--bg-secondary);
+      flex-shrink: 0;
+    }
+
+    .tab-btn {
+      padding: 8px 16px;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+    }
+
+    .tab-btn.active {
+      color: var(--accent-blue);
+      border-bottom-color: var(--accent-blue);
+    }
+
+    .detail-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 8px;
+      background: var(--bg-primary);
+      padding: 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border-color);
+    }
+
+    .meta-card {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .meta-card span {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .meta-card strong {
+      font-family: var(--font-mono);
+      font-size: 13px;
+    }
+
+    .headers-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: var(--bg-primary);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .headers-table th, .headers-table td {
+      padding: 6px 12px;
+      text-align: left;
+      border-bottom: 1px solid rgba(71, 85, 105, 0.4);
+    }
+
+    .headers-table th {
+      background: rgba(30, 41, 59, 0.8);
+      color: var(--text-muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+
+    .headers-table td.header-key {
+      color: var(--accent-blue);
+      width: 35%;
+      word-break: break-all;
+    }
+
+    .headers-table td.header-val {
+      color: var(--text-main);
+      word-break: break-all;
+    }
+
+    .body-box {
+      background: var(--bg-primary);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .body-box-header {
+      background: rgba(30, 41, 59, 0.8);
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .body-content {
+      padding: 12px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 400px;
+      overflow-y: auto;
+      color: #e2e8f0;
+    }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--text-muted);
+      gap: 12px;
+      text-align: center;
+      padding: 24px;
+    }
+
+    .empty-icon {
+      font-size: 32px;
+      opacity: 0.5;
+    }
+
+    /* Notification toast */
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: var(--accent-blue);
+      color: #0f172a;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.2s ease;
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <h1>QuickTunnel Inspector</h1>
+      <div id="connStatus" class="status-badge connected">
+        <span class="status-dot"></span>
+        <span id="connStatusText">Connected</span>
+      </div>
+    </div>
+    <div class="metrics-bar">
+      <div class="metric-item">Requests: <strong id="mTotal">0</strong></div>
+      <div class="metric-item">2xx: <strong id="m2xx" class="status-2xx">0</strong></div>
+      <div class="metric-item">4xx: <strong id="m4xx" class="status-4xx">0</strong></div>
+      <div class="metric-item">5xx: <strong id="m5xx" class="status-5xx">0</strong></div>
+      <div class="metric-item">Avg Latency: <strong id="mLatency">0 ms</strong></div>
+    </div>
+  </header>
+
+  <!-- Filter & Search Toolbar -->
+  <div class="toolbar">
+    <input type="text" id="searchInput" class="search-input" placeholder="Filter requests by path, method, status...">
+    <div class="filter-group">
+      <button class="btn active" data-filter-method="">ALL</button>
+      <button class="btn" data-filter-method="GET">GET</button>
+      <button class="btn" data-filter-method="POST">POST</button>
+      <button class="btn" data-filter-method="PUT">PUT</button>
+      <button class="btn" data-filter-method="DELETE">DELETE</button>
+    </div>
+    <div class="filter-group">
+      <button class="btn active" data-filter-status="">All Status</button>
+      <button class="btn" data-filter-status="2xx">2xx</button>
+      <button class="btn" data-filter-status="4xx">4xx</button>
+      <button class="btn" data-filter-status="5xx">5xx</button>
+    </div>
+    <div class="spacer"></div>
+    <button id="btnClear" class="btn">Clear List</button>
+  </div>
+
+  <!-- Main View -->
+  <div class="main-container">
+    <!-- Requests List Pane -->
+    <div class="requests-pane">
+      <div class="table-header">
+        <div>Method</div>
+        <div>Path</div>
+        <div>Status</div>
+        <div>Time</div>
+        <div>Size</div>
+      </div>
+      <div id="requestsList" class="requests-list">
+        <!-- Rendered items -->
+      </div>
+    </div>
+
+    <!-- Inspector Detail Pane -->
+    <div id="detailPane" class="detail-pane">
+      <div class="empty-state" id="emptyDetail">
+        <div class="empty-icon">&lt;/&gt;</div>
+        <p>Select a request from the list to inspect headers, payload, and timing details.</p>
+      </div>
+
+      <div id="activeDetail" style="display: none; height: 100%; flex-direction: column;">
+        <div class="detail-header">
+          <div class="detail-top-bar">
+            <div class="detail-url-box">
+              <span id="detailMethod" class="req-method method-get">GET</span>
+              <span id="detailPath" style="font-weight: 600; color: #fff;">/</span>
+            </div>
+            <div class="detail-actions">
+              <button id="btnCurl" class="btn btn-action">Copy as cURL</button>
+              <button id="btnReplay" class="btn btn-action btn-replay">Replay</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="detail-nav-tabs">
+          <button class="tab-btn active" data-tab="request">Request</button>
+          <button class="tab-btn" data-tab="response">Response</button>
+        </div>
+
+        <div class="detail-content">
+          <!-- Request Tab View -->
+          <div id="tabRequestContent">
+            <div class="section-title">General</div>
+            <div class="meta-grid">
+              <div class="meta-card">
+                <span>Request ID</span>
+                <strong id="metaId">-</strong>
+              </div>
+              <div class="meta-card">
+                <span>Visitor IP</span>
+                <strong id="metaIp">-</strong>
+              </div>
+              <div class="meta-card">
+                <span>HTTP Version</span>
+                <strong id="metaHttpVer">-</strong>
+              </div>
+              <div class="meta-card">
+                <span>Body Size</span>
+                <strong id="metaReqSize">0 B</strong>
+              </div>
+            </div>
+
+            <div class="section-title" style="margin-top: 16px;">Headers</div>
+            <table class="headers-table">
+              <thead>
+                <tr>
+                  <th>Header</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="reqHeadersList"></tbody>
+            </table>
+
+            <div class="section-title" style="margin-top: 16px;">Body</div>
+            <div class="body-box">
+              <div class="body-box-header">
+                <span id="reqBodyLabel" style="font-size: 11px; color: var(--text-muted);">Payload</span>
+                <button id="btnCopyReqBody" class="btn" style="padding: 2px 8px; font-size: 11px;">Copy</button>
+              </div>
+              <div id="reqBodyContent" class="body-content">(No body)</div>
+            </div>
+          </div>
+
+          <!-- Response Tab View -->
+          <div id="tabResponseContent" style="display: none;">
+            <div class="section-title">General</div>
+            <div class="meta-grid">
+              <div class="meta-card">
+                <span>Status</span>
+                <strong id="metaRespStatus">-</strong>
+              </div>
+              <div class="meta-card">
+                <span>Total Latency</span>
+                <strong id="metaRespTotal">-</strong>
+              </div>
+              <div class="meta-card">
+                <span>TTFB</span>
+                <strong id="metaRespTtfb">-</strong>
+              </div>
+              <div class="meta-card">
+                <span>Body Size</span>
+                <strong id="metaRespSize">0 B</strong>
+              </div>
+            </div>
+
+            <div class="section-title" style="margin-top: 16px;">Headers</div>
+            <table class="headers-table">
+              <thead>
+                <tr>
+                  <th>Header</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="respHeadersList"></tbody>
+            </table>
+
+            <div class="section-title" style="margin-top: 16px;">Body</div>
+            <div class="body-box">
+              <div class="body-box-header">
+                <span id="respBodyLabel" style="font-size: 11px; color: var(--text-muted);">Payload</span>
+                <button id="btnCopyRespBody" class="btn" style="padding: 2px 8px; font-size: 11px;">Copy</button>
+              </div>
+              <div id="respBodyContent" class="body-content">(No body)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast">Action completed</div>
+
+  <script>
+    (function () {
+      const state = {
+        requests: new Map(),
+        selectedId: null,
+        activeTab: 'request',
+        filterMethod: '',
+        filterStatus: '',
+        searchQuery: '',
+      };
+
+      // DOM Elements
+      const connStatus = document.getElementById('connStatus');
+      const connStatusText = document.getElementById('connStatusText');
+      const requestsList = document.getElementById('requestsList');
+      const emptyDetail = document.getElementById('emptyDetail');
+      const activeDetail = document.getElementById('activeDetail');
+      const toast = document.getElementById('toast');
+
+      function showToast(msg) {
+        toast.textContent = msg;
+        toast.classList.add('show');
+        setTimeout(() => toast.classList.remove('show'), 2000);
+      }
+
+      function formatBytes(bytes) {
+        if (!bytes || bytes === 0) return '0 B';
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+      }
+
+      function getMethodClass(method) {
+        const m = (method || '').toUpperCase();
+        if (m === 'GET') return 'method-get';
+        if (m === 'POST') return 'method-post';
+        if (m === 'PUT' || m === 'PATCH') return 'method-put';
+        if (m === 'DELETE') return 'method-delete';
+        return 'method-other';
+      }
+
+      function getStatusClass(status) {
+        if (!status) return 'status-pending';
+        if (status >= 200 && status < 300) return 'status-2xx';
+        if (status >= 300 && status < 400) return 'status-3xx';
+        if (status >= 400 && status < 500) return 'status-4xx';
+        if (status >= 500) return 'status-5xx';
+        return '';
+      }
+
+      function updateMetrics() {
+        fetch('/api/metrics')
+          .then(res => res.json())
+          .then(data => {
+            document.getElementById('mTotal').textContent = data.total_requests || 0;
+            document.getElementById('m2xx').textContent = data.status_2xx || 0;
+            document.getElementById('m4xx').textContent = data.status_4xx || 0;
+            document.getElementById('m5xx').textContent = data.status_5xx || 0;
+            document.getElementById('mLatency').textContent = (data.avg_latency_ms || 0).toFixed(1) + ' ms';
+          })
+          .catch(() => {});
+      }
+
+      function escapeHtml(str) {
+        if (str === null || str === undefined) return '';
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+      }
+
+      function renderRequestRow(req) {
+        const row = document.createElement('div');
+        row.className = 'request-row' + (req.id === state.selectedId ? ' selected' : '');
+        row.dataset.id = req.id;
+
+        const colMethod = document.createElement('div');
+        const spanMethod = document.createElement('span');
+        spanMethod.className = 'req-method ' + getMethodClass(req.request.method);
+        spanMethod.textContent = req.request.method;
+        colMethod.appendChild(spanMethod);
+
+        const colPath = document.createElement('div');
+        colPath.className = 'req-path-container';
+        if (req.is_replay) {
+          const badgeReplay = document.createElement('span');
+          badgeReplay.className = 'badge-replay';
+          badgeReplay.textContent = 'REPLAY';
+          colPath.appendChild(badgeReplay);
+        }
+        const spanPath = document.createElement('span');
+        spanPath.className = 'req-path';
+        spanPath.title = req.request.path;
+        spanPath.textContent = req.request.path;
+        colPath.appendChild(spanPath);
+
+        const colStatus = document.createElement('div');
+        const statusText = req.response ? String(req.response.status) : 'Pending...';
+        colStatus.className = 'req-status ' + getStatusClass(req.response ? req.response.status : null);
+        colStatus.textContent = statusText;
+
+        const colDuration = document.createElement('div');
+        colDuration.className = 'req-duration';
+        colDuration.textContent = req.timing && req.timing.total_ms > 0 ? req.timing.total_ms + 'ms' : '-';
+
+        const colSize = document.createElement('div');
+        colSize.className = 'req-size';
+        colSize.textContent = req.response ? formatBytes(req.response.body_size) : formatBytes(req.request.body_size);
+
+        row.appendChild(colMethod);
+        row.appendChild(colPath);
+        row.appendChild(colStatus);
+        row.appendChild(colDuration);
+        row.appendChild(colSize);
+
+        row.addEventListener('click', () => selectRequest(req.id));
+        return row;
+      }
+
+      function filterMatches(req) {
+        if (state.filterMethod && req.request.method.toUpperCase() !== state.filterMethod) {
+          return false;
+        }
+        if (state.filterStatus) {
+          if (!req.response) return false;
+          const status = req.response.status;
+          if (state.filterStatus === '2xx' && (status < 200 || status >= 300)) return false;
+          if (state.filterStatus === '4xx' && (status < 400 || status >= 500)) return false;
+          if (state.filterStatus === '5xx' && (status < 500 || status >= 600)) return false;
+        }
+        if (state.searchQuery) {
+          const q = state.searchQuery.toLowerCase();
+          const p = req.request.path.toLowerCase();
+          const m = req.request.method.toLowerCase();
+          const s = req.response ? req.response.status.toString() : '';
+          if (!p.includes(q) && !m.includes(q) && !s.includes(q)) return false;
+        }
+        return true;
+      }
+
+      function renderList() {
+        requestsList.innerHTML = '';
+        const sorted = Array.from(state.requests.values()).sort((a, b) => b.id.localeCompare(a.id));
+        for (const req of sorted) {
+          if (filterMatches(req)) {
+            requestsList.appendChild(renderRequestRow(req));
+          }
+        }
+      }
+
+      function formatBody(body) {
+        if (!body) return '(No body)';
+        try {
+          const parsed = JSON.parse(body);
+          return JSON.stringify(parsed, null, 2);
+        } catch {
+          return body;
+        }
+      }
+
+      function selectRequest(id) {
+        state.selectedId = id;
+        const req = state.requests.get(id);
+        if (!req) return;
+
+        // Highlight row
+        document.querySelectorAll('.request-row').forEach(row => {
+          row.classList.toggle('selected', row.dataset.id === id);
+        });
+
+        emptyDetail.style.display = 'none';
+        activeDetail.style.display = 'flex';
+
+        // Top bar
+        const methodEl = document.getElementById('detailMethod');
+        methodEl.textContent = req.request.method;
+        methodEl.className = 'req-method ' + getMethodClass(req.request.method);
+        document.getElementById('detailPath').textContent = req.request.path;
+
+        // General Request Meta
+        document.getElementById('metaId').textContent = req.id;
+        document.getElementById('metaIp').textContent = req.visitor_ip;
+        document.getElementById('metaHttpVer').textContent = req.request.http_version;
+        document.getElementById('metaReqSize').textContent = formatBytes(req.request.body_size);
+
+        // Request Headers (safe textContent to avoid XSS)
+        const reqHeadersList = document.getElementById('reqHeadersList');
+        reqHeadersList.replaceChildren();
+        for (const h of req.request.headers || []) {
+          const tr = document.createElement('tr');
+          const tdKey = document.createElement('td');
+          tdKey.className = 'header-key';
+          tdKey.textContent = h.name;
+          const tdVal = document.createElement('td');
+          tdVal.className = 'header-val';
+          tdVal.textContent = h.value;
+          tr.appendChild(tdKey);
+          tr.appendChild(tdVal);
+          reqHeadersList.appendChild(tr);
+        }
+
+        // Request Body
+        document.getElementById('reqBodyContent').textContent = formatBody(req.request.body);
+
+        // Response Tab Data
+        if (req.response) {
+          const statusClass = getStatusClass(req.response.status);
+          const metaRespStatus = document.getElementById('metaRespStatus');
+          const spanStatus = document.createElement('span');
+          spanStatus.className = statusClass;
+          spanStatus.textContent = req.response.status + ' ' + (req.response.status_text || '');
+          metaRespStatus.replaceChildren(spanStatus);
+
+          document.getElementById('metaRespTotal').textContent = req.timing.total_ms + ' ms';
+          document.getElementById('metaRespTtfb').textContent = req.timing.ttfb_ms + ' ms';
+          document.getElementById('metaRespSize').textContent = formatBytes(req.response.body_size);
+
+          const respHeadersList = document.getElementById('respHeadersList');
+          respHeadersList.replaceChildren();
+          for (const h of req.response.headers || []) {
+            const tr = document.createElement('tr');
+            const tdKey = document.createElement('td');
+            tdKey.className = 'header-key';
+            tdKey.textContent = h.name;
+            const tdVal = document.createElement('td');
+            tdVal.className = 'header-val';
+            tdVal.textContent = h.value;
+            tr.appendChild(tdKey);
+            tr.appendChild(tdVal);
+            respHeadersList.appendChild(tr);
+          }
+          document.getElementById('respBodyContent').textContent = formatBody(req.response.body);
+        } else {
+          document.getElementById('metaRespStatus').textContent = 'Pending...';
+          document.getElementById('metaRespTotal').textContent = '-';
+          document.getElementById('metaRespTtfb').textContent = '-';
+          document.getElementById('metaRespSize').textContent = '-';
+
+          const respHeadersList = document.getElementById('respHeadersList');
+          const tr = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 2;
+          td.style.color = 'var(--text-muted)';
+          td.textContent = '(Waiting for response...)';
+          tr.appendChild(td);
+          respHeadersList.replaceChildren(tr);
+
+          document.getElementById('respBodyContent').textContent = '(Waiting for response...)';
+        }
+      }
+
+      function buildCurlCommand(req) {
+        const hostHeader = (req.request.headers || []).find(h => h.name.toLowerCase() === 'host');
+        const host = hostHeader ? hostHeader.value : window.location.host;
+        const proto = window.location.protocol;
+        const url = `${proto}//${host}${req.request.path}`.replace(/'/g, "'\\''");
+
+        let cmd = `curl -X ${req.request.method.replace(/'/g, "'\\''")} '${url}'`;
+        for (const h of req.request.headers || []) {
+          const lower = h.name.toLowerCase();
+          if (lower !== 'connection' && lower !== 'content-length') {
+            const escName = h.name.replace(/'/g, "'\\''");
+            const escVal = h.value.replace(/'/g, "'\\''");
+            cmd += ` \\\n  -H '${escName}: ${escVal}'`;
+          }
+        }
+
+        if (req.request.body) {
+          const escaped = req.request.body.replace(/'/g, "'\\''");
+          cmd += ` \\\n  --data-raw '${escaped}'`;
+        }
+        return cmd;
+      }
+
+      // Actions
+      document.getElementById('btnCurl').addEventListener('click', () => {
+        const req = state.requests.get(state.selectedId);
+        if (!req) return;
+        const cmd = buildCurlCommand(req);
+        navigator.clipboard.writeText(cmd).then(() => showToast('cURL command copied to clipboard!'));
+      });
+
+      document.getElementById('btnReplay').addEventListener('click', () => {
+        const req = state.requests.get(state.selectedId);
+        if (!req) return;
+        const btn = document.getElementById('btnReplay');
+        btn.textContent = 'Replaying...';
+        btn.disabled = true;
+
+        fetch(`/api/replay/${req.id}`, { method: 'POST' })
+          .then(res => {
+            if (!res.ok) throw new Error('Replay failed: ' + res.statusText);
+            return res.json();
+          })
+          .then(data => {
+            showToast('Replayed successfully!');
+            state.requests.set(data.id, data);
+            renderList();
+            selectRequest(data.id);
+            updateMetrics();
+          })
+          .catch(err => {
+            showToast('Replay error: ' + err.message);
+          })
+          .finally(() => {
+            btn.textContent = 'Replay';
+            btn.disabled = false;
+          });
+      });
+
+      document.getElementById('btnCopyReqBody').addEventListener('click', () => {
+        const text = document.getElementById('reqBodyContent').textContent;
+        navigator.clipboard.writeText(text).then(() => showToast('Body copied!'));
+      });
+
+      document.getElementById('btnCopyRespBody').addEventListener('click', () => {
+        const text = document.getElementById('respBodyContent').textContent;
+        navigator.clipboard.writeText(text).then(() => showToast('Body copied!'));
+      });
+
+      document.getElementById('btnClear').addEventListener('click', () => {
+        state.requests.clear();
+        state.selectedId = null;
+        renderList();
+        emptyDetail.style.display = 'flex';
+        activeDetail.style.display = 'none';
+        showToast('List cleared');
+      });
+
+      // Filter Toolbar events
+      document.querySelectorAll('[data-filter-method]').forEach(btn => {
+        btn.addEventListener('click', e => {
+          document.querySelectorAll('[data-filter-method]').forEach(b => b.classList.remove('active'));
+          e.currentTarget.classList.add('active');
+          state.filterMethod = e.currentTarget.dataset.filterMethod;
+          renderList();
+        });
+      });
+
+      document.querySelectorAll('[data-filter-status]').forEach(btn => {
+        btn.addEventListener('click', e => {
+          document.querySelectorAll('[data-filter-status]').forEach(b => b.classList.remove('active'));
+          e.currentTarget.classList.add('active');
+          state.filterStatus = e.currentTarget.dataset.filterStatus;
+          renderList();
+        });
+      });
+
+      document.getElementById('searchInput').addEventListener('input', e => {
+        state.searchQuery = e.target.value.trim();
+        renderList();
+      });
+
+      // Tab switcher
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+          document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+          e.currentTarget.classList.add('active');
+          state.activeTab = e.currentTarget.dataset.tab;
+          document.getElementById('tabRequestContent').style.display = state.activeTab === 'request' ? 'block' : 'none';
+          document.getElementById('tabResponseContent').style.display = state.activeTab === 'response' ? 'block' : 'none';
+        });
+      });
+
+      // Realtime SSE Connection
+      function setupSSE() {
+        const evtSource = new EventSource('/events');
+
+        evtSource.onopen = () => {
+          connStatus.className = 'status-badge connected';
+          connStatusText.textContent = 'Connected';
+        };
+
+        evtSource.onerror = () => {
+          connStatus.className = 'status-badge disconnected';
+          connStatusText.textContent = 'Reconnecting...';
+        };
+
+        evtSource.onmessage = evt => {
+          try {
+            const req = JSON.parse(evt.data);
+            state.requests.set(req.id, req);
+            renderList();
+            if (state.selectedId === req.id) {
+              selectRequest(req.id);
+            }
+            updateMetrics();
+          } catch (e) {
+            console.error('SSE JSON error', e);
+          }
+        };
+      }
+
+      // Initial fetch of captured requests
+      fetch('/api/requests')
+        .then(res => res.json())
+        .then(data => {
+          if (Array.isArray(data)) {
+            data.forEach(r => state.requests.set(r.id, r));
+            renderList();
+            if (data.length > 0) {
+              selectRequest(data[0].id);
+            }
+          }
+          updateMetrics();
+        })
+        .catch(() => {});
+
+      setupSSE();
+      setInterval(updateMetrics, 5000);
+    })();
+  </script>
+</body>
+</html>

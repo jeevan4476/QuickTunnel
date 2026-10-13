@@ -1,0 +1,24 @@
+[package]
+name = "qt-bench"
+version = "0.1.0"
+edition = "2021"
+description = "QuickTunnel Criterion performance micro-benchmarks"
+publish = false
+
+[dependencies]
+qt-proto = { path = "../crates/qt-proto" }
+qt-mux = { path = "../crates/qt-mux" }
+bytes = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "framing"
+harness = false
+
+[[bench]]
+name = "mux"
+harness = false

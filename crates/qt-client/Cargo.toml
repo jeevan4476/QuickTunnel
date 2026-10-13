@@ -1,0 +1,26 @@
+[package]
+name = "qt-client"
+version = "0.1.0"
+edition = "2021"
+description = "QuickTunnel client implementation"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quicktunnel/quicktunnel"
+
+[dependencies]
+qt-proto = { path = "../qt-proto" }
+qt-mux = { path = "../qt-mux" }
+qt-inspector-ui = { path = "../qt-inspector-ui" }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+httparse = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+qt-server = { path = "../qt-server" }

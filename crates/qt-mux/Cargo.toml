@@ -1,0 +1,16 @@
+[package]
+name = "qt-mux"
+version = "0.1.0"
+edition = "2021"
+description = "QTP multiplexing layer: stream management, flow control, scheduling"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quicktunnel/quicktunnel"
+
+[dependencies]
+qt-proto = { path = "../qt-proto" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }

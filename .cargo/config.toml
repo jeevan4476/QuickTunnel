@@ -1,0 +1,8 @@
+[env]
+LLVM_COV = "/usr/bin/llvm-cov"
+LLVM_PROFDATA = "/usr/bin/llvm-profdata"
+
+[alias]
+lint = "clippy --workspace --all-targets"
+cov = "llvm-cov -p qt-proto --summary-only"
+cov-html = "llvm-cov -p qt-proto --html"

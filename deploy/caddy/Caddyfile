@@ -1,0 +1,22 @@
+# Caddy reverse proxy configuration for QuickTunnel with automated Let's Encrypt TLS
+# Replace tunnel.example.com with your actual root domain.
+
+{
+    email admin@example.com
+}
+
+# Wildcard and apex domain routing
+*.tunnel.example.com, tunnel.example.com {
+    tls {
+        # Wildcard certificates require DNS-01 challenge provider (e.g. Cloudflare)
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+
+    # Proxy HTTP/WebSocket requests to QuickTunnel HTTP proxy listener
+    reverse_proxy 127.0.0.1:8080 {
+        header_up Host {host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-Host {host}
+    }
+}

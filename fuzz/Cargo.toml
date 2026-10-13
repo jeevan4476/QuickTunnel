@@ -1,0 +1,32 @@
+[package]
+name = "qt-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "qt_fuzz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fuzz_header"
+path = "fuzz_targets/fuzz_header.rs"
+test = false
+
+[[bin]]
+name = "fuzz_tlv"
+path = "fuzz_targets/fuzz_tlv.rs"
+test = false
+
+[[bin]]
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+
+[dependencies]
+qt-proto = { path = "../crates/qt-proto" }
+bytes = { workspace = true }
+libfuzzer-sys = "0.4"
+
+[dev-dependencies]
+arbitrary = { version = "1.3", features = ["derive"] }
