@@ -63,6 +63,7 @@ impl HttpProxy {
                 .accept()
                 .await
                 .map_err(|e| ProtoError::IoError(e.to_string()))?;
+            socket.set_nodelay(true).ok();
 
             let this = self.clone();
             tokio::spawn(async move {
@@ -79,117 +80,271 @@ impl HttpProxy {
         mut visitor_io: T,
         peer_addr: SocketAddr,
     ) -> Result<()> {
-        let timeout = self.read_timeout;
-        let read_headers_fut = read_http_headers(&mut visitor_io);
+        let mut initial_read = true;
+        let mut leftover = Vec::new();
 
-        let (buffer, header_end) = match tokio::time::timeout(timeout, read_headers_fut).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => {
-                if matches!(e, ProtoError::FrameTooLarge(_, _)) {
-                    let resp = b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 36\r\n\r\n431 Request Header Fields Too Large\n";
+        loop {
+            let timeout = if initial_read {
+                self.read_timeout
+            } else {
+                Duration::from_secs(5)
+            };
+
+            let read_headers_fut = read_http_headers_with_leftover(&mut visitor_io, leftover);
+            let (buffer, header_end) = match tokio::time::timeout(timeout, read_headers_fut).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => {
+                    if !initial_read
+                        && matches!(e, ProtoError::IoError(ref s) if s.contains("Visitor closed connection"))
+                    {
+                        return Ok(());
+                    }
+                    if matches!(e, ProtoError::FrameTooLarge(_, _)) {
+                        let resp = b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 36\r\n\r\n431 Request Header Fields Too Large\n";
+                        visitor_io.write_all(resp).await.ok();
+                        visitor_io.flush().await.ok();
+                    }
+                    return Err(e);
+                }
+                Err(_) => {
+                    if !initial_read {
+                        return Ok(());
+                    }
+                    let resp = b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 21\r\n\r\n408 Request Timeout\n";
                     visitor_io.write_all(resp).await.ok();
                     visitor_io.flush().await.ok();
+                    return Err(ProtoError::ProtocolError("HTTP header read timeout".into()));
                 }
-                return Err(e);
-            }
-            Err(_) => {
-                let resp = b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 21\r\n\r\n408 Request Timeout\n";
+            };
+            initial_read = false;
+
+            // Parse HTTP request headers using httparse
+            let mut headers = [httparse::EMPTY_HEADER; 64];
+            let mut req = httparse::Request::new(&mut headers);
+            if let Err(e) = req.parse(&buffer[..header_end + 4]) {
+                let resp = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 25\r\n\r\n400 Bad Request: invalid\n";
                 visitor_io.write_all(resp).await.ok();
                 visitor_io.flush().await.ok();
-                return Err(ProtoError::ProtocolError("HTTP header read timeout".into()));
+                return Err(ProtoError::ProtocolError(format!("HTTP parse error: {e}")));
             }
-        };
 
-        // Parse HTTP request headers using httparse
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut req = httparse::Request::new(&mut headers);
-        if let Err(e) = req.parse(&buffer[..header_end + 4]) {
-            let resp = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 25\r\n\r\n400 Bad Request: invalid\n";
-            visitor_io.write_all(resp).await.ok();
-            visitor_io.flush().await.ok();
-            return Err(ProtoError::ProtocolError(format!("HTTP parse error: {e}")));
+            let is_http_11 = req.version.unwrap_or(1) == 1;
+            let mut client_close = false;
+            let mut client_keepalive = false;
+            let mut req_content_length: Option<usize> = None;
+
+            for h in req.headers.iter() {
+                if h.name.eq_ignore_ascii_case("Connection") {
+                    if let Ok(val) = std::str::from_utf8(h.value) {
+                        let lower = val.to_ascii_lowercase();
+                        if lower.contains("close") {
+                            client_close = true;
+                        }
+                        if lower.contains("keep-alive") {
+                            client_keepalive = true;
+                        }
+                    }
+                } else if h.name.eq_ignore_ascii_case("Content-Length") {
+                    if let Ok(val) = std::str::from_utf8(h.value) {
+                        if let Ok(cl) = val.trim().parse::<usize>() {
+                            req_content_length = Some(cl);
+                        }
+                    }
+                }
+            }
+
+            let visitor_wants_keepalive = if is_http_11 {
+                !client_close
+            } else {
+                client_keepalive
+            };
+
+            // Find Host header
+            let host_val = req
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("Host"))
+                .and_then(|h| std::str::from_utf8(h.value).ok());
+
+            let host = match host_val {
+                Some(h) => h,
+                None => {
+                    let resp = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 30\r\n\r\n400 Bad Request: missing Host\n";
+                    visitor_io.write_all(resp).await.ok();
+                    visitor_io.flush().await.ok();
+                    return Err(ProtoError::ProtocolError("Missing Host header".into()));
+                }
+            };
+
+            let subdomain = extract_subdomain(host, &self.root_domain);
+            let tunnel_opt = match subdomain.as_deref() {
+                Some(s) => self.registry.find_http(s),
+                None => self.registry.find_single_http(),
+            };
+            let tunnel = match tunnel_opt {
+                Some(entry) => entry,
+                None => {
+                    let body = "404 Not Found: tunnel not found\n";
+                    let resp = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    visitor_io.write_all(resp.as_bytes()).await.ok();
+                    visitor_io.flush().await.ok();
+                    return Ok(());
+                }
+            };
+
+            // Open virtual stream over MuxSession to client
+            let mut mux_stream = match tunnel.mux_handle.open_stream().await {
+                Ok(s) => s,
+                Err(_) => {
+                    let body = "502 Bad Gateway: tunnel unavailable\n";
+                    let resp = format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    visitor_io.write_all(resp.as_bytes()).await.ok();
+                    visitor_io.flush().await.ok();
+                    return Ok(());
+                }
+            };
+
+            // Inject standard X-Forwarded-* proxy headers
+            let mut forwarded = Vec::with_capacity(header_end + 256);
+            forwarded.extend_from_slice(&buffer[..header_end]);
+            let injected = format!(
+                "\r\nX-Forwarded-For: {}\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: {}\r\n\r\n",
+                peer_addr.ip(),
+                host
+            );
+            forwarded.extend_from_slice(injected.as_bytes());
+
+            let already_buffered_body = buffer.len().saturating_sub(header_end + 4);
+            let req_body_total = req_content_length.unwrap_or(0);
+            let buffered_to_send = already_buffered_body.min(req_body_total);
+
+            if buffered_to_send > 0 {
+                forwarded
+                    .extend_from_slice(&buffer[header_end + 4..header_end + 4 + buffered_to_send]);
+            }
+
+            let leftover_offset = header_end + 4 + buffered_to_send;
+            leftover = if buffer.len() > leftover_offset {
+                buffer[leftover_offset..].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            // Send rewritten request headers + any buffered body bytes
+            mux_stream
+                .write_all(&forwarded)
+                .await
+                .map_err(|e| ProtoError::IoError(e.to_string()))?;
+            mux_stream
+                .flush()
+                .await
+                .map_err(|e| ProtoError::IoError(e.to_string()))?;
+
+            let remaining_req_body = req_body_total.saturating_sub(buffered_to_send);
+
+            let (mut visitor_r, mut visitor_w) = tokio::io::split(&mut visitor_io);
+            let (mut mux_r, mut mux_w) = tokio::io::split(&mut mux_stream);
+
+            let body_fut = async {
+                if remaining_req_body > 0 {
+                    let mut copied = 0;
+                    let mut chunk = [0u8; 8192];
+                    while copied < remaining_req_body {
+                        let to_read = (remaining_req_body - copied).min(chunk.len());
+                        let n = visitor_r.read(&mut chunk[..to_read]).await?;
+                        if n == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "Visitor body premature EOF",
+                            ));
+                        }
+                        mux_w.write_all(&chunk[..n]).await?;
+                        copied += n;
+                    }
+                    mux_w.flush().await?;
+                }
+                Ok::<(), std::io::Error>(())
+            };
+
+            let mut resp_can_keepalive = true;
+            let resp_fut = async {
+                let mut buf = [0u8; 8192];
+                let mut header_buf = Vec::new();
+                let mut parsed_headers = false;
+                let mut expected_response_len: Option<usize> = None;
+                let mut total_transferred = 0;
+
+                loop {
+                    let n = mux_r.read(&mut buf).await?;
+                    if n == 0 {
+                        if expected_response_len.is_some()
+                            && total_transferred < expected_response_len.unwrap()
+                        {
+                            resp_can_keepalive = false;
+                        }
+                        break;
+                    }
+
+                    total_transferred += n;
+                    visitor_w.write_all(&buf[..n]).await?;
+
+                    if !parsed_headers {
+                        header_buf.extend_from_slice(&buf[..n]);
+                        if let Some(crlf_pos) = find_crlf_crlf(&header_buf) {
+                            parsed_headers = true;
+                            let header_end_offset = crlf_pos + 4;
+                            let mut resp_headers = [httparse::EMPTY_HEADER; 64];
+                            let mut resp = httparse::Response::new(&mut resp_headers);
+                            if let Ok(httparse::Status::Complete(_)) = resp.parse(&header_buf) {
+                                for h in resp.headers.iter() {
+                                    if h.name.eq_ignore_ascii_case("Connection") {
+                                        if let Ok(s) = std::str::from_utf8(h.value) {
+                                            if s.to_ascii_lowercase().contains("close") {
+                                                resp_can_keepalive = false;
+                                            }
+                                        }
+                                    } else if h.name.eq_ignore_ascii_case("Content-Length") {
+                                        if let Ok(s) = std::str::from_utf8(h.value) {
+                                            if let Ok(cl) = s.trim().parse::<usize>() {
+                                                expected_response_len =
+                                                    Some(header_end_offset + cl);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(expected_len) = expected_response_len {
+                        if total_transferred >= expected_len {
+                            visitor_w.flush().await?;
+                            break;
+                        }
+                    }
+                }
+
+                visitor_w.flush().await?;
+                if expected_response_len.is_none() {
+                    resp_can_keepalive = false;
+                }
+                Ok::<(), std::io::Error>(())
+            };
+
+            tokio::try_join!(body_fut, resp_fut).map_err(|e| ProtoError::IoError(e.to_string()))?;
+
+            if !visitor_wants_keepalive || !resp_can_keepalive {
+                break;
+            }
         }
-
-        // Find Host header
-        let host_val = req
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("Host"))
-            .and_then(|h| std::str::from_utf8(h.value).ok());
-
-        let host = match host_val {
-            Some(h) => h,
-            None => {
-                let resp = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 30\r\n\r\n400 Bad Request: missing Host\n";
-                visitor_io.write_all(resp).await.ok();
-                visitor_io.flush().await.ok();
-                return Err(ProtoError::ProtocolError("Missing Host header".into()));
-            }
-        };
-
-        let subdomain = extract_subdomain(host, &self.root_domain);
-        let tunnel_opt = match subdomain.as_deref() {
-            Some(s) => self.registry.find_http(s),
-            None => self.registry.find_single_http(),
-        };
-        let tunnel = match tunnel_opt {
-            Some(entry) => entry,
-            None => {
-                let body = "404 Not Found: tunnel not found\n";
-                let resp = format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                visitor_io.write_all(resp.as_bytes()).await.ok();
-                visitor_io.flush().await.ok();
-                return Ok(());
-            }
-        };
-
-        // Open virtual stream over MuxSession to client
-        let mut mux_stream = match tunnel.mux_handle.open_stream().await {
-            Ok(s) => s,
-            Err(_) => {
-                let body = "502 Bad Gateway: tunnel unavailable\n";
-                let resp = format!(
-                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                visitor_io.write_all(resp.as_bytes()).await.ok();
-                visitor_io.flush().await.ok();
-                return Ok(());
-            }
-        };
-
-        // Inject standard X-Forwarded-* proxy headers
-        let mut forwarded = Vec::with_capacity(header_end + 256);
-        forwarded.extend_from_slice(&buffer[..header_end]);
-        let injected = format!(
-            "\r\nX-Forwarded-For: {}\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: {}\r\n\r\n",
-            peer_addr.ip(),
-            host
-        );
-        forwarded.extend_from_slice(injected.as_bytes());
-        if buffer.len() > header_end + 4 {
-            forwarded.extend_from_slice(&buffer[header_end + 4..]);
-        }
-
-        // Send rewritten request headers + any buffered body bytes
-        mux_stream
-            .write_all(&forwarded)
-            .await
-            .map_err(|e| ProtoError::IoError(e.to_string()))?;
-        mux_stream
-            .flush()
-            .await
-            .map_err(|e| ProtoError::IoError(e.to_string()))?;
-
-        // Splice visitor socket and QTP virtual stream bidirectionally
-        tokio::io::copy_bidirectional(&mut visitor_io, &mut mux_stream)
-            .await
-            .map_err(|e| ProtoError::IoError(e.to_string()))?;
 
         Ok(())
     }
@@ -223,9 +378,11 @@ pub fn extract_subdomain(host: &str, root_domain: &str) -> Option<String> {
     None
 }
 
-/// Read HTTP headers from stream until `\r\n\r\n` is found
-async fn read_http_headers<T: AsyncRead + Unpin>(io: &mut T) -> Result<(Vec<u8>, usize)> {
-    let mut buffer = Vec::with_capacity(1024);
+/// Read HTTP headers from stream with existing leftover bytes until `\r\n\r\n` is found
+async fn read_http_headers_with_leftover<T: AsyncRead + Unpin>(
+    io: &mut T,
+    mut buffer: Vec<u8>,
+) -> Result<(Vec<u8>, usize)> {
     let mut chunk = [0u8; 1024];
 
     loop {
@@ -566,5 +723,78 @@ mod tests {
         assert!(String::from_utf8_lossy(&resp[..n]).contains("404 Not Found"));
 
         run_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_proxy_keepalive_multiple_requests() {
+        let registry = Arc::new(TunnelRegistry::new(20000..=20010, "example.com".into()));
+        let proxy = HttpProxy::new(
+            "127.0.0.1:8080".parse().unwrap(),
+            registry.clone(),
+            "example.com".into(),
+        );
+
+        let (mux_client_io, mux_server_io) = tokio::io::duplex(65536);
+        let (server_session, server_handle) =
+            qt_mux::MuxSession::new(mux_server_io, qt_mux::MuxConfig::server());
+        let (client_session, client_handle) =
+            qt_mux::MuxSession::new(mux_client_io, qt_mux::MuxConfig::client());
+        tokio::spawn(server_session.run());
+        tokio::spawn(client_session.run());
+
+        registry
+            .register_http(1, 10, Some("demo"), server_handle)
+            .unwrap();
+
+        let (mut visitor_client, visitor_server) = tokio::io::duplex(4096);
+        let visitor_task = tokio::spawn(async move {
+            proxy
+                .handle_visitor(visitor_server, "192.168.1.1:54321".parse().unwrap())
+                .await
+        });
+
+        // Request 1
+        visitor_client
+            .write_all(b"GET /req1 HTTP/1.1\r\nHost: demo.example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut stream1 = client_handle.accept_stream().await.unwrap();
+        let mut req_buf1 = vec![0u8; 1024];
+        let n1 = stream1.read(&mut req_buf1).await.unwrap();
+        assert!(String::from_utf8_lossy(&req_buf1[..n1]).contains("GET /req1"));
+
+        stream1
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nres1")
+            .await
+            .unwrap();
+
+        let mut resp_buf1 = vec![0u8; 1024];
+        let n1_resp = visitor_client.read(&mut resp_buf1).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp_buf1[..n1_resp]).contains("res1"));
+
+        // Request 2 on the SAME visitor socket
+        visitor_client
+            .write_all(b"GET /req2 HTTP/1.1\r\nHost: demo.example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut stream2 = client_handle.accept_stream().await.unwrap();
+        let mut req_buf2 = vec![0u8; 1024];
+        let n2 = stream2.read(&mut req_buf2).await.unwrap();
+        assert!(String::from_utf8_lossy(&req_buf2[..n2]).contains("GET /req2"));
+
+        stream2
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nres2")
+            .await
+            .unwrap();
+
+        let mut resp_buf2 = vec![0u8; 1024];
+        let n2_resp = visitor_client.read(&mut resp_buf2).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp_buf2[..n2_resp]).contains("res2"));
+
+        // Close visitor cleanly
+        drop(visitor_client);
+        assert!(visitor_task.await.unwrap().is_ok());
     }
 }

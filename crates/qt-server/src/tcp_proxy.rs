@@ -100,6 +100,7 @@ impl TcpProxyManager {
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((socket, peer_addr)) => {
+                                socket.set_nodelay(true).ok();
                                 let mgr = this.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = mgr.bridge_tcp(socket, peer_addr, port).await {

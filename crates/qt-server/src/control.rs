@@ -107,6 +107,7 @@ impl ControlListener {
                 .accept()
                 .await
                 .map_err(|e| ProtoError::IoError(e.to_string()))?;
+            socket.set_nodelay(true).ok();
 
             let this = self.clone();
             tokio::spawn(async move {
